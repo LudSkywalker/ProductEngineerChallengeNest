@@ -29,14 +29,32 @@ import { Category } from './products/category.entity';
     }),
     CacheModule.registerAsync({
       isGlobal: true,
-      useFactory: async () => ({
-        store: await redisStore({
+      useFactory: async () => {
+        const redisCache = (await redisStore({
           host: process.env.REDIS_HOST || 'localhost',
           port: parseInt(process.env.REDIS_PORT || '6379', 10),
-          db: 0,
+          db: parseInt(process.env.REDIS_DB || '0', 10),
           ttl: 60000,
-        }),
-      }),
+        })) as unknown as {
+          get(key: string): Promise<string | undefined>;
+          set(key: string, value: unknown, ttl?: number): Promise<boolean>;
+          del(key: string): Promise<boolean>;
+          reset(): Promise<void>;
+        };
+        return {
+          stores: {
+            opts: {},
+            get: (key: string | string[]) =>
+              Array.isArray(key)
+                ? Promise.all(key.map((k: string) => redisCache.get(k)))
+                : redisCache.get(key),
+            set: (key: string, value: unknown, ttl?: number) =>
+              redisCache.set(key, value, ttl),
+            delete: (key: string) => redisCache.del(key),
+            clear: () => redisCache.reset(),
+          },
+        };
+      },
     }),
     UsersModule,
     ProductsModule,

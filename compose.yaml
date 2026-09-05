@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: challengedb
     ports:
       - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -21,6 +23,8 @@ services:
     container_name: challenge-redis
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -28,6 +32,39 @@ services:
       retries: 20
     networks:
       - cache-network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: challenge-api:dev
+    container_name: challenge-api
+    working_dir: /app
+    # Ahora solo se monta código; node_modules vive en la capa de imagen
+    volumes:
+      - ./src:/app/src
+      - ./test:/app/test
+      - ./package.json:/app/package.json
+      - ./pnpm-workspace.yaml:/app/pnpm-workspace.yaml
+      - ./nest-cli.json:/app/nest-cli.json
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.build.json:/app/tsconfig.build.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    networks:
+      - backend
+      - cache-network
+
+volumes:
+  pgdata:
+  redisdata:
 
 networks:
   backend:

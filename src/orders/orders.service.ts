@@ -1,49 +1,54 @@
-import { Injectable, NotFoundException, BadRequestException, Inject } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Cache } from 'cache-manager';
 import { Order, OrderStatus } from './order.entity';
 import { OrderItem } from './order-item.entity';
+import { Product } from '../products/product.entity';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UsersService } from '../users/users.service';
 import { ProductsService } from '../products/products.service';
 
 const paymentService = {
-  async processPayment(orderId: number, amount: number): Promise<{ success: boolean; transactionId: string }> {
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
+  async processPayment(
+    orderId: number,
+    amount: number,
+  ): Promise<{ success: boolean; transactionId: string }> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
     if (Math.random() < 0.1) {
-      throw new Error('Payment service unavailable');
+      throw new Error(
+        `Payment service unavailable (order ${orderId}, amount ${amount})`,
+      );
     }
-    
+
     return { success: true, transactionId: `TXN-${Date.now()}` };
-  }
+  },
 };
 
 @Injectable()
 export class OrdersService {
-  private maxRetries = 1000;
+  private maxRetries = 3;
 
   constructor(
     @InjectRepository(Order)
     private ordersRepository: Repository<Order>,
-    @InjectRepository(OrderItem)
-    private orderItemsRepository: Repository<OrderItem>,
     private usersService: UsersService,
     private productsService: ProductsService,
-    @Inject(CACHE_MANAGER)
-    private cacheManager: Cache,
   ) {}
 
   async findAll(): Promise<Order[]> {
-    return this.ordersRepository.find({ 
-      relations: ['user', 'items', 'items.product'] 
+    return this.ordersRepository.find({
+      relations: ['user', 'items', 'items.product'],
     });
   }
 
   async findOne(id: number): Promise<Order> {
-    const order = await this.ordersRepository.findOne({ 
+    const order = await this.ordersRepository.findOne({
       where: { id },
       relations: ['user', 'items', 'items.product'],
     });
@@ -54,7 +59,7 @@ export class OrdersService {
   }
 
   async findByUser(userId: number): Promise<Order[]> {
-    return this.ordersRepository.find({ 
+    return this.ordersRepository.find({
       where: { userId },
       relations: ['items', 'items.product'],
     });
@@ -62,37 +67,63 @@ export class OrdersService {
 
   async create(createOrderDto: CreateOrderDto): Promise<Order> {
     const user = await this.usersService.findOne(createOrderDto.userId);
-    
-    const order = this.ordersRepository.create({
-      userId: user.id,
-      status: OrderStatus.PENDING,
-    });
-    const savedOrder = await this.ordersRepository.save(order);
-    
-    let total = 0;
-    for (const itemDto of createOrderDto.items) {
-      const product = await this.productsService.findOne(itemDto.productId);
-      
-      if (product.stock < itemDto.quantity) {
-        throw new BadRequestException(`Not enough stock for ${product.name}`);
-      }
-      
-      const orderItem = this.orderItemsRepository.create({
-        orderId: savedOrder.id,
-        productId: product.id,
-        quantity: itemDto.quantity,
-        price: product.price,
+
+    return this.ordersRepository.manager.transaction(async (manager) => {
+      const order = manager.create(Order, {
+        userId: user.id,
+        status: OrderStatus.PENDING,
+        total: 0,
       });
-      
-      await this.orderItemsRepository.save(orderItem);
-      total += product.price * itemDto.quantity;
-      this.productsService.updateStock(product.id, product.stock - itemDto.quantity);
-    }
-    
-    savedOrder.total = total;
-    await this.ordersRepository.save(savedOrder);
-    
-    return this.findOne(savedOrder.id);
+      const savedOrder = await manager.save(order);
+
+      let total = 0;
+      for (const itemDto of createOrderDto.items) {
+        const product = await manager.findOne(Product, {
+          where: { id: itemDto.productId },
+        });
+        if (!product) {
+          throw new NotFoundException(
+            `Product #${itemDto.productId} not found`,
+          );
+        }
+
+        const result = await manager
+          .createQueryBuilder()
+          .update(Product)
+          .set({ stock: () => 'stock - :qty' })
+          .where('id = :id AND stock >= :qty', {
+            id: product.id,
+            qty: itemDto.quantity,
+          })
+          .execute();
+
+        if (result.affected !== 1) {
+          throw new BadRequestException(`Not enough stock for ${product.name}`);
+        }
+
+        const orderItem = manager.create(OrderItem, {
+          orderId: savedOrder.id,
+          productId: product.id,
+          quantity: itemDto.quantity,
+          price: product.price,
+        });
+        await manager.save(orderItem);
+
+        total += Number(product.price) * itemDto.quantity;
+      }
+
+      savedOrder.total = total;
+      await manager.save(savedOrder);
+
+      const finalOrder = await manager.findOne(Order, {
+        where: { id: savedOrder.id },
+        relations: ['user', 'items', 'items.product'],
+      });
+      if (!finalOrder) {
+        throw new NotFoundException(`Order #${savedOrder.id} not found`);
+      }
+      return finalOrder;
+    });
   }
 
   async updateStatus(id: number, status: OrderStatus): Promise<Order> {
@@ -101,40 +132,54 @@ export class OrdersService {
     return this.ordersRepository.save(order);
   }
 
-  async processPayment(orderId: number): Promise<{ success: boolean; transactionId: string }> {
+  async processPayment(
+    orderId: number,
+  ): Promise<{ success: boolean; transactionId: string }> {
     const order = await this.findOne(orderId);
-    
-    let lastError: Error;
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+
+    let lastError: Error | undefined;
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
-        const result = await paymentService.processPayment(orderId, Number(order.total));
-        
+        const result = await paymentService.processPayment(
+          orderId,
+          Number(order.total),
+        );
+
         if (result.success) {
           order.status = OrderStatus.CONFIRMED;
           await this.ordersRepository.save(order);
           return result;
         }
       } catch (error) {
-        lastError = error;
-        await new Promise(resolve => setTimeout(resolve, 100));
+        lastError = error as Error;
+        if (attempt < this.maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
     }
-    
-    throw lastError!;
+
+    throw new ServiceUnavailableException(
+      `Payment failed after ${this.maxRetries} attempts: ${
+        lastError?.message ?? 'unknown error'
+      }`,
+    );
   }
 
   async cancel(id: number): Promise<Order> {
     const order = await this.findOne(id);
-    
+
     if (order.status !== OrderStatus.PENDING) {
       throw new BadRequestException('Only pending orders can be cancelled');
     }
-    
+
     for (const item of order.items) {
       const product = await this.productsService.findOne(item.productId);
-      await this.productsService.updateStock(product.id, product.stock + item.quantity);
+      await this.productsService.updateStock(
+        product.id,
+        product.stock + item.quantity,
+      );
     }
-    
+
     order.status = OrderStatus.CANCELLED;
     return this.ordersRepository.save(order);
   }
@@ -144,15 +189,33 @@ export class OrdersService {
       where: { id },
       relations: ['user', 'items', 'items.product', 'items.product.category'],
     });
-    
+
     if (!order) {
       throw new NotFoundException(`Order #${id} not found`);
     }
 
-    const enriched: any = { ...order };
-    enriched.user = { ...order.user };
-    enriched.user.latestOrder = enriched;
-
-    return JSON.parse(JSON.stringify(enriched));
+    return {
+      id: order.id,
+      status: order.status,
+      total: order.total,
+      createdAt: order.createdAt,
+      user: {
+        id: order.user.id,
+        name: order.user.name,
+        email: order.user.email,
+      },
+      items: order.items.map((item) => ({
+        id: item.id,
+        quantity: item.quantity,
+        price: item.price,
+        product: {
+          id: item.product.id,
+          name: item.product.name,
+          ...(item.product.category
+            ? { category: item.product.category.name }
+            : {}),
+        },
+      })),
+    };
   }
 }
